@@ -1,0 +1,19 @@
+# eda webhook listening for Dynatrace workflows
+- name: webhook workflows dynatrace
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5003
+  rules:
+    - name: rollback remediationAction
+      condition: event.payload.remediationAction == "rollback remediationAction"
+      action:
+        run_job_template:
+          name: job template name
+          organization: organization name
+    - name: generic print event
+      condition: event.meta.headers is defined
+      action:
+        print_event:
+          pretty: true

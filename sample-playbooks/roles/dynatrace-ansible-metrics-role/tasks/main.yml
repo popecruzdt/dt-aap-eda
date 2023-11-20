@@ -1,0 +1,22 @@
+---
+# tasks file for dynatrace-ansible-metrics
+- name: "metric ingest - linux"
+  uri:
+    url: "{{ dt_metrics_ingest_url }}"
+    method: POST
+    headers:
+      content-type: "text/plain; charset=utf-8"
+    body: "ansible.{{ dt_metrics_group }}.{{ dt_metrics_name }},type=\"{{ job_type }}\",id=\"{{ job_id }}\",template=\"{{ job_template }}\",launch=\"{{ job_launch_type }}\" {{ dt_metrics_value }}"
+    status_code: 202
+  ignore_errors: yes
+  when: ansible_system == "Linux"
+- name: "metric ingest - windows"
+  win_uri:
+    url: "{{ dt_metrics_ingest_url }}"
+    method: POST
+    headers:
+      content-type: "text/plain; charset=utf-8"
+    body: "ansible.{{ dt_metrics_group }}.{{ dt_metrics_name }},type=\"{{ job_type }}\",id=\"{{ job_id }}\",template=\"{{ job_template }}\",launch=\"{{ job_launch_type }}\" {{ dt_metrics_value }}"
+    status_code: 202
+  ignore_errors: yes
+  when: ansible_system == "Windows"

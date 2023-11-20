@@ -1,0 +1,74 @@
+# initiate k8s/ocp deployment
+---
+-
+  hosts: "{{ hosts_group }}"
+  name: "initiate k8s deployment"
+  tasks:
+    -
+      name: "metrics - started job (ansible.jobs.started)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.started
+        dt_metrics_value: 1
+    -
+      name: "initiate deployment change tasks (block)"
+      block:
+        -
+          name: "copy deployment yaml file"
+          shell: "cp -f {{ deployment_yaml_file }} /tmp/deployment.yaml"
+        -
+          name: "replace release version in yaml"
+          replace:
+            path: /tmp/deployment.yaml
+            regexp: "value: RELEASE_VERSION"
+            replace: "value: {{ deployment_release }}"
+        -
+          name: "update kubectl config context"
+          shell: "/usr/local/bin/kubectl config use-context {{ kubernetes_context }}"
+        -
+          name: "update deployment with yaml and kubectl"
+          shell: "/usr/local/bin/kubectl apply -f /tmp/deployment.yaml"
+        -
+          name: "push Dynatrace custom deployment event"
+          uri:
+            url: https://{{ dynatrace_api_url }}/api/v2/events/ingest
+            method: POST
+            headers:
+              content-type: application/json
+              Authorization: "Api-Token {{ dynatrace_token }}"
+            body:
+              eventType: CUSTOM_DEPLOYMENT
+              timeout: 3
+              title: "{{ deployment_name }}"
+              entitySelector: "type(SERVICE),tag(k8s-namespace:{{ deployment_namespace }}),tag(k8s-pod:{{ deployment_pod }})"
+              properties:
+                Change Ticket: "{{ 99999999 | random(10000000, 10) }}"
+                Details: "{{ deployment_details }}"
+                Feature Flag: "{{ deployment_feature }}"
+                FF Previous State: "{{ deployment_p_state }}"
+                FF Current State: "{{ deployment_c_state }}"
+                source: ansible automation platform
+                deploymentName: "{{ deployment_name }}"
+                deploymentVersion: "{{ deployment_version }}"
+                remediationAction: "{{ deployment_remediation }}"
+            body_format: json
+            status_code: 201
+      rescue:
+        -
+          name: "metrics - failed job (ansible.jobs.failed)"
+          include_role:
+            name: dynatrace-ansible-metrics-role
+          vars:
+            dt_metrics_group: "{{ metrics_group }}"
+            dt_metrics_name: jobs.failed
+            dt_metrics_value: 1
+    -
+      name: "metrics - completed job (ansible.jobs.completed)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.completed
+        dt_metrics_value: 1

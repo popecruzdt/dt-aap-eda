@@ -1,0 +1,15 @@
+---
+- name: "Dynatrace Rulebook"
+  hosts: all
+  sources:
+    - dynatrace.eda.dt_esa_api:
+        dt_api_host: "https://<abc123>.live.dynatrace.com"
+        dt_api_token: "dt0c01.<TOKEN>"
+        delay: 60 # (Default is 1 min) i.e plugin runs every 1 minute
+
+  rules:
+    - name: "sample"
+      condition: event.payload.problemTitle is defined
+      action:
+        print_event:
+          pretty: true

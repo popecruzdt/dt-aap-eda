@@ -1,0 +1,12 @@
+---
+# defaults file for dynatrace-ansible-metrics
+# dynatrace (dt) variables
+dt_metrics_ingest_url: http://localhost:14499/metrics/ingest
+dt_metrics_group: default
+dt_metrics_name: default
+dt_metrics_value: 1
+# ansible (awx) variables
+job_type: default
+job_id: "{{ tower_job_id }}"
+job_template: "{{ tower_job_template_name }}"
+job_launch_type: "{{ tower_job_launch_type }}"

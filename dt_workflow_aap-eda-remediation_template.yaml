@@ -84,7 +84,7 @@ workflow:
           						"emoji": true
           					},
           					"value": "eda",
-          					"url": "https://ec2-34-228-219-9.compute-1.amazonaws.com/"
+          					"url": "https://eda-controller"
           				},
           				{
           					"type": "button",
@@ -94,7 +94,7 @@ workflow:
           						"emoji": true
           					},
           					"value": "controller",
-          					"url": "https://ec2-23-20-82-182.compute-1.amazonaws.com/"
+          					"url": "https://controller"
           				}
           			]
           		}
@@ -821,10 +821,13 @@ workflow:
             var start_time_epoch = event['event.start'];
             // if start time is in ISO format (not epoch), convert to epoch
             if(isNaN(start_time_epoch)){
+              console.log('start time is in ISO format, converting to epoch milliseconds');
               start_time_epoch = Date.parse(start_time_epoch);
-            } 
-            // if start time is in epoch format, convert from nanoseconds epoch to milliseconds epoch
-            start_time_epoch = start_time_epoch / 1000 / 1000;
+            } else {
+              // if start time is in epoch format, convert from nanoseconds epoch to milliseconds epoch
+              // start_time_epoch = start_time_epoch / 1000 / 1000;
+              // removed 2/20/2024 with PPX-898 (1.285)
+            }
             
             // get the root cause entity and entity type
             const root_cause_entity_id = event['root_cause_entity_id'];

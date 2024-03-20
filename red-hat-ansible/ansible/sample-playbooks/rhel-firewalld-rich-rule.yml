@@ -1,0 +1,70 @@
+# manage a firewalld rich rule configuration on linux
+---
+-
+  hosts: "{{ hosts }}"
+  name: "manage firewalld rich rule configuration"
+  tasks:
+    -
+      name: "metrics - started job (ansible.jobs.started)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.started
+        dt_metrics_value: 1
+      when: metrics_enabled
+    -
+      name: "initiate configuration tasks (block)"
+      block:
+        -
+          name: "manage firewalld rich rule"
+          ansible.posix.firewalld:
+            rich_rule: "rule family={{ rich_rule_family }} port port={{ rich_rule_port }} protocol={{ rich_rule_protocol }} source address={{ rich_rule_address }} {{ rich_rule_target }}" #rule family=ipv4 forward-port port=443 protocol=tcp to-port=8443
+            zone: "{{ rich_rule_zone}}" #public
+            permanent: "{{ rich_rule_permanent }}" #false
+            immediate: "{{ rich_rule_immediate }}" #true
+            state: "{{ rich_rule_state }}" #enabled
+          become: true
+          register: firewalld_return
+        -
+          name: "push Dynatrace custom configuration event"
+          uri:
+            url: https://{{ dynatrace_api_url }}/api/v2/events/ingest
+            method: POST
+            headers:
+              content-type: application/json
+              Authorization: "Api-Token {{ dynatrace_token }}"
+            body:
+              eventType: CUSTOM_CONFIGURATION
+              timeout: 5
+              title: "{{ configuration_name }}"
+              entitySelector: "type(HOST),tag(\"Ansible Host:{{ linux_host }}\")"
+              properties:
+                rich_rule: "rule family={{ rich_rule_family }} port={{ rich_rule_port }} protocol={{ rich_rule_protocol }} source address={{ rich_rule_address }}" #rule family=ipv4 forward-port port=443 protocol=tcp to-port=8443
+                zone: "{{ rich_rule_zone}}"
+                permanent: "{{ rich_rule_permanent }}"
+                immediate: "{{ rich_rule_immediate }}"
+                state: "{{ rich_rule_state }}"
+                target: "{{ rich_rule_target }}"
+                source: "ansible automation platform"
+            body_format: json
+            status_code: 201
+      rescue:
+        -
+          name: "metrics - failed job (ansible.jobs.failed)"
+          include_role:
+            name: dynatrace-ansible-metrics-role
+          vars:
+            dt_metrics_group: "{{ metrics_group }}"
+            dt_metrics_name: jobs.failed
+            dt_metrics_value: 1
+          when: metrics_enabled
+    -
+      name: "metrics - completed job (ansible.jobs.completed)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.completed
+        dt_metrics_value: 1
+      when: metrics_enabled

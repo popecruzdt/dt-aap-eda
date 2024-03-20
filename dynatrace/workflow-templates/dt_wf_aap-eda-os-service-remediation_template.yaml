@@ -1,0 +1,483 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.392.1
+  inputs: []
+workflow:
+  title: aap-eda-remediation os service availability template
+  tasks:
+    js_query_service:
+      name: js_query_service
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { queryExecutionClient } from '@dynatrace-sdk/client-query';
+
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+
+          const PROBLEM_TASK = 'js_active_problem_details';
+
+
+          export default async function ({ execution_id }) {
+
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+            
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+
+            // problem details
+            const problem_details = await ex.result(PROBLEM_TASK);
+            const start_time_epoch = problem_details['start_time_epoch'];
+            const affected_entity_type = problem_details['affected_entity_type']; 
+            const affected_entity_id = problem_details['affected_entity_id'];
+
+            // query entity details for remediation
+            const timeout = 60;
+            const query = 'fetch `dt.entity.os:service`\
+                          | filter id == "' + affected_entity_id + '"\
+                          | fields id, entity.name, service_host = runs_on[dt.entity.host], status, startup_type, alerting\
+                          | lookup [fetch dt.entity.host\
+                                    | filter isNotNull(runs[`dt.entity.os:service`])\
+                                    | expand tags\
+                                    | filter matchesPhrase(tags,"Ansible Host")\
+                                    | parse tags, "\'Ansible Host:\' LD:ansible_host"\
+                                    | fields id, entity.name, ansible_host, hostGroupName ], sourceField: service_host, lookupField: id, prefix: "host."';
+            
+            const query_response = await queryExecutionClient.queryExecute({ body: { query, requestTimeoutMilliseconds: timeout * 1000, fetchTimeoutSeconds: timeout  } });
+
+            return query_response.result;
+
+            
+          }
+      position:
+        x: 0
+        y: 3
+      predecessors:
+        - js_active_problem_details
+      conditions:
+        states:
+          js_active_problem_details: SUCCESS
+        custom: "{{ result('js_active_problem_details')[\"affected_entity_is_service\"]
+          == true }}"
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ( { execution_id }) {
+
+            // EDA_URL - the Event Driven Ansible Controller Webhook URL with relevant Rulebook Activation
+            let EDA_URL = "http://hostname:5003"; // i.e. EDA_URL = "https://eda.example.com:5000";
+            
+            return { EDA_URL };
+          }
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    js_add_problem_comment:
+      name: js_add_problem_comment
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { eventsClient, problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          export default async function ({ execution_id }) {
+            
+            // get the event from the execution event
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+
+            // post a comment on the problem card that self-healing was successful
+            const problem_id = event['event.id'];
+            await problemsClient.createComment({
+              problemId: problem_id,
+              body: { 
+                context: "AutomationEngine Workflow " + execution_id,
+                message: "Problem state changed to RESOLVED. Ansible Automation Platform self-healing successful. *drops mic*"
+              }
+            });
+
+            
+          }
+      position:
+        x: -2
+        y: 3
+      predecessors:
+        - js_closed_problem_comments
+      conditions:
+        states:
+          js_closed_problem_comments: SUCCESS
+        custom: "{{ result('js_closed_problem_comments')[\"previous_remediation\"] ==
+          true }}"
+    js_eda_send_remediation:
+      name: js_eda_send_remediation
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+          import { problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+
+          const REMEDIATIONS_TASK = 'js_process_remediations';
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+            const eda_url = parameters['EDA_URL'];
+            
+            // get the remediationAction loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            console.log(actionEx.loopItem);
+            const remediationActionDetails = actionEx.loopItem['results'];
+            const remediationAction = remediationActionDetails['remediationAction'];
+            const service = remediationActionDetails['service'];
+            
+            console.log(remediationActionDetails);
+
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+            method: "POST",
+            headers: {
+              'content-type': "application/json",
+            },
+              body: JSON.stringify(remediationActionDetails)
+            };
+            
+            // execute the fetch() api call to register the user
+            const resp = await fetch(eda_url,options);
+            console.log(resp.status);
+            const eda_response_code = resp.status;
+
+            if(eda_response_code == 200) {
+              // add a comment to the problem indicating the remediation was attempted
+              const problem_id = event['event.id'];
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: "Executing problem remediation action '" + remediationAction + "' for '" + service + "' via Event Driven Ansible."
+                }
+              });
+            } else {
+              // add a comment to the problem indicating the remediation attempt failed with status code
+              const problem_id = event['event.id'];
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: "Failed attempting problem remediation action '" + remediationAction + "' for '" + service + "' via Event Driven Ansible.  EDA response code '" + eda_response_code + "'!"
+                }
+              });
+            }
+            
+            // return the remediation details
+            return { 'service': service, 'remediationAction': remediationAction, 'response': eda_response_code };
+          }
+      position:
+        x: 0
+        y: 5
+      predecessors:
+        - js_process_remediations
+      conditions:
+        states:
+          js_process_remediations: SUCCESS
+        custom: "{{ result('js_process_remediations') | length >= 1 }}"
+      concurrency: 1
+      withItems: results in {{ result('js_process_remediations') }}
+    js_process_remediations:
+      name: js_process_remediations
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { eventsClient, problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+
+          const SERVICE_TASK = 'js_query_service';
+
+
+          export default async function ({ execution_id }) {
+
+            // create array of all remediationActions to send to EDA
+            var remediationActions = new Array();
+            
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+            
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+
+            // deployment remediations
+            const services_result = await ex.result(SERVICE_TASK);
+            const services = services_result['records'];
+
+            // collect all services details as remediation actions
+            for(var s=0; s<services.length; s++) {
+              const service = services[s];
+              const rA = {
+                'execution_id': execution_id,
+                'type': 'configuration',
+                'remediationAction': 'os service deploy and restart',
+                'entity_type': 'dt.entity.os:service',
+                'entity_id': service['id'],
+                'entity_host_name': service['host.entity.name'],
+                'entity_host_group': service['host.hostGroupName'],
+                'entity_host_id': service['host.id'],
+                'host': service['host.ansible_host'],
+                'service': service['entity.name']
+              };
+              console.log("Service: " + service['entity.name'] + ", Host: " + service['host.ansible_host']);
+              remediationActions.push(rA);
+            }
+
+            // if there aren't any remediationActions found, post a comment on the problem
+            if(remediationActions.length == 0) {
+              const problem_id = event['event.id'];
+
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: "Unable to locate any auto-remediation solutions for this problem."
+                }
+              });
+            }
+            
+            return remediationActions;
+
+            
+          }
+      position:
+        x: 0
+        y: 4
+      predecessors:
+        - js_query_service
+      conditions:
+        states:
+          js_query_service: SUCCESS
+        custom: "{{ result('js_query_service')['records'] | length >= 1 }}"
+    js_active_problem_details:
+      name: js_active_problem_details
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { eventsClient, problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          export default async function ({ execution_id }) {
+            
+            // get the event from the execution event
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+
+            // handle alerting profiles as array
+            var alerting_profiles = event['labels.alerting_profile'];
+            if(alerting_profiles === undefined) {
+              alerting_profiles = new Array();
+              alerting_profiles.push("None");
+            } else if (!Array.isArray(alerting_profiles)) {
+              const ap = alerting_profiles;
+              alerting_profiles = new Array();
+              alerting_profiles.push(ap);
+            }
+            
+            // add a comment to the problem indicating remediation workflow triggered
+            const problem_id = event['event.id'];
+
+            await problemsClient.createComment({
+              problemId: problem_id,
+              body: { 
+                context: "AutomationEngine Workflow " + execution_id,
+                message: "Problem detected. Attempting to find auto-remediation solution with Event Driven Ansible."
+              }
+            });
+
+            // get the event start time
+            var start_time_epoch = event['event.start'];
+            // if start time is in ISO format (not epoch), convert to epoch
+            if(isNaN(start_time_epoch)){
+              console.log('start time is in ISO format, converting to epoch milliseconds');
+              start_time_epoch = Date.parse(start_time_epoch);
+            } else {
+              // if start time is in epoch format, convert from nanoseconds epoch to milliseconds epoch
+              // start_time_epoch = start_time_epoch / 1000 / 1000;
+              // removed 2/20/2024 with PPX-898 (1.285)
+            }
+            
+            // get the affected entity type
+            const affected_entity_ids = event['affected_entity_ids'];
+            const affected_entity_types = event['affected_entity_types'];
+            var affected_entity_id;
+            var affected_entity_type;
+            var affected_entity_is_service = false;
+            var affected_entity_is_host = false;
+
+            // check if affected entity types is an array, if array then index required
+            if(Array.isArray(affected_entity_types)) {
+              affected_entity_type = affected_entity_types[0];
+            } else {
+              affected_entity_type = affected_entity_types;
+            }
+
+            // check if affected entity id is an array, if array then index required
+            if(Array.isArray(affected_entity_types)) {
+              affected_entity_id = affected_entity_ids[0];
+            } else {
+              affected_entity_id = affected_entity_ids;
+            }
+
+            // identify if affected entity type is os service, host, or other
+            if(affected_entity_type == "dt.entity.os:service") {
+              affected_entity_is_service = true;
+            } else if (affected_entity_type == "dt.entity.host"){
+              affected_entity_is_host = true;
+            }
+            
+            return { 'start_time_epoch': start_time_epoch, 
+                     'affected_entity_type': affected_entity_type, 
+                     'affected_entity_id': affected_entity_id,
+                     'affected_entity_is_service': affected_entity_is_service,
+                     'affected_entity_is_host': affected_entity_is_service,
+                     'alerting_profiles': alerting_profiles };
+          }
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+        custom: "{{ event()[\"event.status\"] == 'ACTIVE' }}"
+    js_closed_problem_comments:
+      name: js_closed_problem_comments
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the event from the execution event
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+            const problem_id = event['event.id'];
+
+            // set the remediation variables
+            var previous_remediation = false;
+            var remediation_details = "";
+
+            // handle alerting profiles as array
+            var alerting_profiles = event['labels.alerting_profile'];
+            if(alerting_profiles === undefined) {
+              alerting_profiles = new Array();
+              alerting_profiles.push("None");
+            } else if (!Array.isArray(alerting_profiles)) {
+              const ap = alerting_profiles;
+              alerting_profiles = new Array();
+              alerting_profiles.push(ap);
+            }
+
+            // get the problem comments
+            const comments_response = await problemsClient.getComments({
+              problemId: problem_id,
+            });
+
+            console.log(comments_response);
+            
+            // check the comments for previous remediations executed for this problem
+            const comments = comments_response['comments'];
+            for(var c=0; c<comments.length; c++) {
+              var comment = comments[c];
+              if(comment['context'] === undefined) {
+                comment['context'] = "undefined";
+              }
+              if(comment['content'].startsWith("Executing problem remediation action") && comment['context'].startsWith("AutomationEngine Workflow")) {
+                  previous_remediation = true;
+                  remediation_details = comment['content'];
+              }
+            }
+
+            return { 'previous_remediation': previous_remediation, 
+                     'remediation_details': remediation_details,
+                     'alerting_profiles': alerting_profiles };
+
+            
+          }
+      position:
+        x: -2
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+        custom: "{{ event()[\"event.status\"] == 'CLOSED' }}"
+  description: ""
+  trigger:
+    eventTrigger:
+      filterQuery: event.kind == "DAVIS_PROBLEM" AND (event.category ==
+        "AVAILABILITY") AND
+        (matchesPhrase(labels.alerting_profile,"alerting-profile-name") and
+        dt.davis.is_duplicate == false)
+      isActive: true
+      uniqueExpression: '{{ event()["event.id"] }}-{{ "open" if
+        event()["event.status_transition"] in ("CREATED", "UPDATED", "REOPENED",
+        "REFRESHED") else "resolved" }}-{{
+        event()["dt.davis.last_reopen_timestamp"] }}'
+      triggerConfiguration:
+        type: davis-problem
+        value:
+          categories:
+            availability: true
+          entityTags: {}
+          customFilter: matchesPhrase(labels.alerting_profile,"alerting-profile-name") and
+            dt.davis.is_duplicate == false
+          onProblemClose: true
+          entityTagsMatch: null
+  schemaVersion: 3

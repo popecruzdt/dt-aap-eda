@@ -1,0 +1,22 @@
+---
+- name: Download OneAgent installer in specific version to a custom
+    directory with additional OneAgent install parameters. Both linux_other
+    and linux_arm have different user specified by platform args parameter.
+  hosts: "{{ hosts }}"
+  collections:
+    - dynatrace.oneagent
+  #vars_files:
+  #  - encrypted_credentials.yml
+  vars:
+    ansible_become: true
+    oneagent_package_state: "{{ dt_installed_state }}"
+    oneagent_download_dir: "{{ dt_download_dir }}"
+    oneagent_version: "{{ dt_version }}"
+    oneagent_install_args:
+      - INSTALL_PATH="{{ dt_install_path }}"
+      - --set-host-group="{{ dt_host_group }}"
+      - --set-network-zone="{{ dt_network_zone }}"
+      - --set-monitoring-mode="{{ dt_monitoring_mode }}"
+  tasks:
+    - import_role:
+        name: oneagent

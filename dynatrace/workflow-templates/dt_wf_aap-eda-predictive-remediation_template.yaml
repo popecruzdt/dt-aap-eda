@@ -1,0 +1,736 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.392.1
+      - id: dynatrace.davis.workflow.actions
+        version: ^1.1.7
+      - id: dynatrace.slack
+        version: ^1.3.9
+  inputs:
+    - type: connection
+      schema: app:dynatrace.slack:connection
+      targets:
+        - tasks.slack_eda_in_thread.connection
+        - tasks.slack_message_summary.connection
+        - tasks.slack_details_in_thread.connection
+workflow:
+  title: aap-eda-remediation predictive capacity template
+  tasks:
+    set_parameters:
+      name: set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >+
+          export default async function () {
+
+            // METRIC - the host disk metric to predict capacity issues
+            let METRIC = "dt.host.disk.free"; // i.e. METRIC = "dt.host.disk.free";
+            
+            // THRESHOLD - predict violations where metric value is less than this amount
+            let THRESHOLD = 10; // i.e. THRESHOLD = 20; violation when disk free space is predicted to be below 20%
+
+            // HOST - the HOST entity ID in Dynatrace (not the name!!) as a String ("")
+            let HOST = "HOST-AB3EB8C0807B7DDA"; // i.e. HOST = "HOST-AB3EB8C0807B7DDA";
+
+            // DAYS - the number of days in the past to analyze to determine the Davis AI prediction
+            let DAYS = 7; // i.e. DAYS = 7; use disk free space percent from the last 7 days to predict future data points
+
+            // DELTA_THRESHOLD - the number of hours between now and the predicted violation that determines urgency
+            let DELTA_THRESHOLD = 24; // i.e. DELTA_THRESHOLD = 8; if the violation is predicted in less than 8 hours, mark it as urgent
+
+            // EDA_URL - the Event Driven Ansible Controller Webhook URL with relevant Rulebook Activation
+            let EDA_URL = "http://hostname:5000"; // i.e. EDA_URL = "https://eda.example.com:5000";
+            
+            return { THRESHOLD, HOST, DAYS, DELTA_THRESHOLD, EDA_URL };
+          }
+
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    wait_30_seconds:
+      name: wait_30_seconds
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: |-
+          export default async function () {
+
+            const sleep = async (waitTime: number) =>
+            new Promise(resolve =>
+              setTimeout(resolve, waitTime));
+            
+            const waitTime = async () => {
+            await sleep(30000);
+            console.log("Finished Waiting");
+            }
+
+            console.log("Waiting 30 Seconds");
+            waitTime();
+            
+          }
+      position:
+        x: -1
+        y: 5
+      predecessors:
+        - raise_violation_events
+      conditions:
+        states:
+          raise_violation_events: SUCCESS
+        custom: "{{ result('raise_violation_events') | length >= 1 }}"
+    check_prediction:
+      name: check_prediction
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const TASK_ID = 'predict_capacity';
+
+
+          export default async function ({ execution_id }) {
+            // get parameters and results from previous tasks
+            const exe = await execution(execution_id);
+            // parameters
+            const parameters = await exe.result('set_parameters');
+            const FREE_THRESHOLD = parameters['THRESHOLD'];
+            const DELTA_THRESHOLD = parameters['DELTA_THRESHOLD'];
+            // predictions
+            const predResult = await exe.result(TASK_ID);
+            const result = predResult['result'];
+            console.log("Total number of predicted lines: " + result.output.length);
+            // declare prediction summary (blank)
+            const predictionSummary = { 
+              threshold: FREE_THRESHOLD, 
+              violation: false, 
+              violations: new Array<Record<string, string>>()
+            };
+
+            // Process predictions
+            // Check if prediction was successful.
+            if (result.resultStatus == 'SUCCESSFUL' && result.executionStatus == 'COMPLETED') {
+                console.log('Prediction was successful.')
+                // Check each predicted result, if it violates the threshold.
+                for (let i = 0; i < result.output.length; i++) {
+                  const prediction = result.output[i];
+
+                  // Check if the prediction result is considered valid
+                  if (prediction.analysisStatus == 'OK' && prediction.forecastQualityAssessment == 'VALID') {
+                      // get the last predicted value, which should be the lowest
+                      const lowerPredictions = prediction.timeSeriesDataWithPredictions.records[0]['dt.davis.forecast:lower'];
+                      const lastValue = lowerPredictions[lowerPredictions.length-1];
+                      // check against the threshold
+                      if (lastValue < FREE_THRESHOLD) {
+                        predictionSummary.violation = true;
+                        // we need to remember all metric properties in the result,
+                        // to inform the next actions which disk ran out of space
+                        predictionSummary.violations.push(prediction.timeSeriesDataWithPredictions.records[0]);
+
+                        // violation is true, determine the first predicted data point below the threshold and get the timestamp
+                        var violation_index = lowerPredictions.length-1;
+                        for(var l=0; l<lowerPredictions.length; l++) {
+                          if(lowerPredictions[l] < FREE_THRESHOLD) {
+                            violation_index = l;
+                            break;
+                          }
+                        }
+
+                        // get the current time in milliseconds
+                        const now_ms = Date.now();
+                        
+                        // get the start time
+                        const prediction_timeframe_start = new Date(prediction.timeSeriesDataWithPredictions.records[0]['timeframe']['start']);
+
+                        // get the interval
+                        const prediction_timeframe_interval = parseInt(prediction.timeSeriesDataWithPredictions.records[0]['interval']);
+                        
+                        // set the delta time
+                        const prediction_timeframe_delta = (prediction_timeframe_interval * violation_index) / 1000 / 1000;
+
+                        // calculate the violation timestamp
+                        const prediction_violation_timestamp = new Date(Date.parse(prediction_timeframe_start) + prediction_timeframe_delta);
+
+                        // add the violation timestamp and threshold to the prediction violation
+                        predictionSummary.violations[predictionSummary.violations.length-1].violation_timestamp = prediction_violation_timestamp;
+                        predictionSummary.violations[predictionSummary.violations.length-1].violation_threshold = FREE_THRESHOLD;
+
+                        // calculate the delta between now and violation timestamp in hours
+                        const prediction_timeframe_now_delta = Math.round((Date.parse(prediction_violation_timestamp) - now_ms) / 1000 / 3600);
+                        predictionSummary.violations[predictionSummary.violations.length-1].violation_delta = prediction_timeframe_now_delta;
+
+                        // mark the violation as urgent if the violation timestamp is within the DELTA_THRESHOLD
+                        if(prediction_timeframe_now_delta <= DELTA_THRESHOLD) {
+                          predictionSummary.violations[predictionSummary.violations.length-1].violation_urgent = true;
+                        } else {
+                          predictionSummary.violations[predictionSummary.violations.length-1].violation_urgent = false;
+                        }
+                      }
+                  }
+                }
+                console.log(predictionSummary.violations.length == 0 ? 'No violations found :)' : '' + predictionSummary.violations.length + ' capacity shortages were found!')
+                return predictionSummary;
+            } else {
+                console.log('Prediction run failed!');
+            }
+          }
+      position:
+        x: 0
+        y: 3
+      predecessors:
+        - predict_capacity
+      conditions:
+        states:
+          predict_capacity: SUCCESS
+    predict_capacity:
+      name: predict_capacity
+      description: Execute a customizable AI/ML task using Davis® analyzers
+      action: dynatrace.davis.workflow.actions:davis-analyze
+      active: true
+      input:
+        body:
+          nPaths: 200
+          useModelCache: true
+          timeSeriesData: "timeseries avg({{ result('set_parameters').METRIC }}), filter:
+            {dt.entity.host==\"{{ result('set_parameters').HOST }}\"},
+            by:{dt.entity.host, dt.entity.disk}, bins: 120, from:now()-{{
+            result('set_parameters').DAYS }}d, to:now()"
+          forecastHorizon: 100
+          generalParameters:
+            timeframe:
+              endTime: now
+              startTime: now-7d
+            logVerbosity: WARNING
+            resolveDimensionalQueryData: false
+          coverageProbability: 0.9
+          applyZeroLowerBoundHeuristic: false
+        analyzerName: dt.statistics.GenericForecastAnalyzer
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - set_parameters
+      conditions:
+        states:
+          set_parameters: SUCCESS
+        custom: ""
+    ansible_eda_urgent:
+      name: ansible_eda_urgent
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+          import { problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK = 'set_parameters';
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+            const eda_url = parameters['EDA_URL'];
+            
+            // get the event loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const event = actionEx.loopItem['event'];
+            const disk_name = event['entityId']['name'];
+            const disk_entity = event['entityId']['entityId']['id'];
+            const disk_event_properties = event['properties'];
+
+            // find the urgent property
+            const find_urgent = (element) => element['key'] == "urgent";
+            const urgent = disk_event_properties[disk_event_properties.findIndex(find_urgent)]['value'];
+            console.log('urgent: ' + urgent);
+
+            if(urgent == "false") {
+              return { 'urgent': urgent, 'type': 'Predicted Disk Capacity Issue', 'disk': disk_name, 'entity': disk_entity, 'response': 'none' };
+            }
+
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+            method: "POST",
+            headers: {
+              'content-type': "application/json",
+            },
+              body: JSON.stringify({
+                "execution": execution_id,
+                "type": "Predicted Disk Capacity Issue",
+                "disk": disk_name,
+                "entity": disk_entity,
+                "urgent": urgent
+              })
+            };
+            
+            // execute the fetch() api call to register the user
+            const resp = await fetch(eda_url,options);
+            console.log(resp.status);
+            const eda_response_code = resp.status;
+
+            if(eda_response_code == 200) {
+              // add a comment to the problem indicating the remediation was attempted
+              const problem_id = event['problemId'];
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: "Executing problem remediation action for 'Predicted Disk Capacity Issue' via Event Driven Ansible."
+                }
+              });
+            } else {
+              // add a comment to the problem indicating the remediation attempt failed with status code
+              const problem_id = event['event.id'];
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: "Failed attempting problem remediation action for 'Predicted Disk Capacity Issue' via Event Driven Ansible.  EDA response code '" + eda_response_code + "'!"
+                }
+              });
+            }
+            
+            // return the remediation details
+            return { 'urgent': urgent, 'type': 'Predicted Disk Capacity Issue', 'disk': disk_name, 'entity': disk_entity, 'response': eda_response_code };
+          }
+      position:
+        x: 1
+        y: 7
+      predecessors:
+        - get_event_details_for_slack
+      conditions:
+        states:
+          get_event_details_for_slack: SUCCESS
+        custom: "{{ result('get_event_details_for_slack') | length >= 1 }}"
+      concurrency: 1
+      withItems: event in {{ result('get_event_details_for_slack') }}
+    slack_eda_in_thread:
+      name: slack_eda_in_thread
+      description: Send a message to a Slack workspace
+      action: dynatrace.slack:slack-send-message
+      input:
+        channel: C064J38P9MG
+        message: >-
+          {
+          	"blocks": [
+          		{
+          			"type": "section",
+          			"block_id": "sectionHeader",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Dynatrace :dt: + Red Hat :redhat: Ansible :ansible: \n Automatic predictive self-healing"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "sectionResults",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "{% for event in result('ansible_eda_urgent') %} {% if event['urgent'] == 'true' %} Disk: [ {{ event['disk'] }} ] \n Entity: [ {{ event['entity'] }} ] \n EDA Response: [ {{ event['response'] }} ] {% endif %} {% endfor %}"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "actions",
+          			"elements": [
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "Open EDA Controller",
+          						"emoji": true
+          					},
+          					"value": "eda",
+          					"url": "https://eda-controller.hostname.com/"
+          				},
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "Open Ansible Controller",
+          						"emoji": true
+          					},
+          					"value": "controller",
+          					"url": "https://ansible-controller.hostname.com/"
+          				}
+          			]
+          		}
+          	]
+          }
+        reaction: []
+        connection: ""
+        workflowID: "{{ execution().workflow.id }}"
+        channelType: id
+        executionID: "{{ execution().id }}"
+        executionDate: "{{ execution().started_at }}"
+        appendToThread: true
+        selectedRequestType: 0
+        attachmentToggleValue: none
+      position:
+        x: 1
+        y: 9
+      predecessors:
+        - ansible_eda_urgent
+        - slack_details_in_thread
+      conditions:
+        states:
+          ansible_eda_urgent: SUCCESS
+          slack_details_in_thread: SUCCESS
+    slack_message_summary:
+      name: slack_message_summary
+      description: Send a message to a Slack workspace
+      action: dynatrace.slack:slack-send-message
+      active: true
+      input:
+        channel: C064J38P9MG
+        message: >
+          {
+          	"blocks": [
+          		{
+          			"type": "section",
+          			"block_id": "sectionHeader",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Disk Capacity Prediction by Davis :dt: \n Workflow Execution: [{{ execution().id }}]"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "sectionResults",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Free Disk Capacity (%) Threshold: [{{ result('check_prediction').threshold }}] \n :warning: Predicted violation events: [ {{ result('get_event_details_for_slack') | length }} ] :warning:"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "actions",
+          			"elements": [
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Dashboard",
+          						"emoji": true
+          					},
+          					"value": "dashboard",
+          					"url": "https://tenantid.apps.dynatrace.com/ui/apps/dynatrace.dashboards/dashboard/d071f5d8-743d-49c6-af6b-4cdf811a7829#from=now-7d&to=now9"
+          				},
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Workflow Execution",
+          						"emoji": true
+          					},
+          					"value": "workflow",
+          					"url": "https://tenantid.apps.dynatrace.com/ui/apps/dynatrace.automations/executions/{{ execution().id }}"
+          				}
+          			]
+          		}
+          	]
+          }
+        reaction: []
+        connection: ""
+        workflowID: "{{ execution().workflow.id }}"
+        channelType: id
+        executionID: "{{ execution().id }}"
+        executionDate: "{{ execution().started_at }}"
+        appendToThread: false
+        selectedRequestType: 0
+        attachmentToggleValue: none
+      position:
+        x: 0
+        y: 7
+      predecessors:
+        - get_event_details_for_slack
+      conditions:
+        states:
+          get_event_details_for_slack: SUCCESS
+        custom: "{{ result('get_event_details_for_slack') | length >= 1 }}"
+    raise_violation_events:
+      name: raise_violation_events
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { eventsClient, EventIngestEventType } from
+          "@dynatrace-sdk/client-classic-environment-v2";
+
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ({ execution_id }) {
+           const exe = await execution(execution_id);
+           const checkResult = await exe.result('check_prediction');
+           const violations = await checkResult.violations;
+           const timeout_minutes = 10;
+
+           var events = new Array();
+            
+           // Raise an event for each violation
+           for(var i=0; i<violations.length; i++) {
+             const violation = violations[i];
+             const violation_title = 'Predicted Disk Capacity Issue: Free space % predicted to drop below [ ' + violation['violation_threshold'] + '% ] at [ ' + violation['violation_timestamp'] + ' ]';
+             const event_response = await eventsClient.createEvent({
+                   body : {
+                       eventType: EventIngestEventType.ResourceContentionEvent,
+                       title: violation_title,
+                       timeout: timeout_minutes,
+                       entitySelector: 'type(DISK),entityId("' + violation['dt.entity.disk'] + '")',
+                       properties: {
+                           'dt.entity.host' : violation['dt.entity.host'],
+                           'threshold' : violation['violation_threshold'],
+                           'violation timestamp' : violation['violation_timestamp'],
+                           'current free space' : Math.round(violation['dt.davis.forecast:point'][0]),
+                           'urgent' : violation['violation_urgent'],
+                           'prediction' : 'Predicted Disk Capacity Issue'
+                       }
+                   }
+               });
+               console.log(event_response);
+               if(event_response.eventIngestResults[0].status == "OK"){
+                 events.push(event_response.eventIngestResults[0].correlationId);
+               }
+           }
+
+           return events; 
+          };
+      position:
+        x: 0
+        y: 4
+      predecessors:
+        - check_prediction
+      conditions:
+        states:
+          check_prediction: SUCCESS
+        custom: "{{ result('check_prediction').violations | length >= 1 }}"
+    slack_details_in_thread:
+      name: slack_details_in_thread
+      description: Send a message to a Slack workspace
+      action: dynatrace.slack:slack-send-message
+      active: true
+      input:
+        channel: C064J38P9MG
+        message: >-
+          {
+          	"blocks": [
+          		{
+          			"type": "section",
+          			"block_id": "sectionHeader",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Disk Capacity Prediction by Davis :dt:"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "sectionResults",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "EventId: [{{ _.event['eventId'] }}] \n Disk Name: [{{ _.event['entityId']['name'] }}]"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "mzList",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Management Zones: {% for mz in _.event['managementZones'] %} \n - {{ mz['name'] }} {% endfor %}"
+          			}
+          		},
+                  {
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "violationTimestamp",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Violation Timestamp: {% for prop in _.event['properties'] %} {% if prop['key'] == 'violation timestamp' %} {{ prop['value'] }} {% endif %} {% endfor %}"
+          			}
+          		},
+                  {
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "currentCapacity",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Current Capacity (%): {% for prop in _.event['properties'] %} {% if prop['key'] == 'current free space' %} {{ prop['value'] }} {% endif %} {% endfor %}"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "actions",
+          			"elements": [
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Dashboard",
+          						"emoji": true
+          					},
+          					"value": "dashboard",
+          					"url": "https://tenantid.apps.dynatrace.com/ui/apps/dynatrace.dashboards/dashboard/d071f5d8-743d-49c6-af6b-4cdf811a7829#from=now-7d&to=now"
+          				},
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Problem",
+          						"emoji": true
+          					},
+          					"value": "workflow",
+          					"url": "https://tenantid.apps.dynatrace.com/ui/apps/dynatrace.classic.problems/#problems/problemdetails;gf=all;pid={{ _.event['problemId'] }}"
+          				}
+          			]
+          		}
+          	]
+          }
+        reaction: []
+        connection: ""
+        workflowID: "{{ execution().workflow.id }}"
+        channelType: id
+        executionID: "{{ execution().id }}"
+        executionDate: "{{ execution().started_at }}"
+        appendToThread: true
+        selectedRequestType: 0
+        attachmentToggleValue: none
+      position:
+        x: 0
+        y: 8
+      predecessors:
+        - slack_message_summary
+      conditions:
+        states:
+          slack_message_summary: SUCCESS
+        custom: "{{ result('get_event_details_for_slack') | length >= 1 }}"
+      concurrency: 1
+      withItems: event in {{ result('get_event_details_for_slack') }}
+    get_event_details_for_slack:
+      name: get_event_details_for_slack
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { eventsClient, problemsClient } from
+          "@dynatrace-sdk/client-classic-environment-v2";
+
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ({ execution_id }) {
+            // get the results from the raised events
+            const ex = await execution(execution_id);
+            const result_events = await ex.result('raise_violation_events');
+
+            // get the actual events from querying the event correlationid
+            var detailed_events = new Array();
+            for(var i=0; i<result_events.length; i++) {
+              const event_query_config = {
+                eventSelector: "correlationId(\"" + result_events[i] + "\"),status(\"OPEN\")"
+              }
+              const event_response = await eventsClient.getEvents(event_query_config);
+
+              //console.log(event_response);
+
+              // get the problems generated from the events
+              for(var p=0; p<event_response.events.length; p++) {
+                const event = event_response.events[p];
+                const problem_query_config = {
+                  entitySelector: "type(DISK),entityId(\"" + event['entityId']['entityId']['id'] + "\")",
+                  problemSelector: "status(\"OPEN\"),text(\"" + event['title'].substring(0,25) + "\")",
+                  from: "now-1m"
+                }
+                
+                const problem_response = await problemsClient.getProblems(problem_query_config);
+            
+                //console.log(problem_response);
+
+                for(var q=0; q<problem_response.problems.length; q++) {
+                  const problem = problem_response.problems[q];
+
+                  event_response.events[p]['problemId'] = problem['problemId'];
+
+                  await problemsClient.createComment({
+                    problemId: problem.problemId,
+                    body: { 
+                      context: "AutomationEngine Workflow " + execution_id,
+                      message: problem.title
+                    }
+                  });
+
+                  await problemsClient.createComment({
+                    problemId: problem.problemId,
+                    body: { 
+                      context: "AutomationEngine Workflow " + execution_id,
+                      message: "This problem will automatically close after 15 minutes.  The problem closing is not an indicator that the disk space capacity predicted issue should be ignored." 
+                    }
+                  });
+                }
+              }
+
+              for(var j=0; j<event_response.events.length; j++) {
+                const event = event_response.events.pop();
+                detailed_events.push(event);
+              }
+           
+            }
+            
+            return detailed_events;
+          }
+      position:
+        x: 0
+        y: 6
+      predecessors:
+        - wait_30_seconds
+      conditions:
+        states:
+          wait_30_seconds: SUCCESS
+        custom: "{{ result('raise_violation_events') | length >= 1 }}"
+  description: ""
+  trigger:
+    schedule:
+      rule: null
+      trigger:
+        type: time
+        time: 09:00
+      timezone: America/Chicago
+      isActive: true
+      isFaulty: false
+      nextExecution: 2024-03-21T14:00:00.000Z
+      filterParameters:
+        earliestStart: 2023-07-31T00:00:00.000Z
+      inputs: {}
+  schemaVersion: 3

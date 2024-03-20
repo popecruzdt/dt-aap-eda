@@ -1,0 +1,72 @@
+# deploy (install and start) a linux package and service
+---
+-
+  hosts: "{{ hosts }}"
+  name: "deploy linux package and service"
+  tasks:
+    -
+      name: "metrics - started job (ansible.jobs.started)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.started
+        dt_metrics_value: 1
+      when: metrics_enabled
+    -
+      name: "initiate deployment tasks (block)"
+      block:
+        -
+          name: "Install or update to the latest version if it doesn't exist"
+          ansible.builtin.dnf:
+            name: "{{ linux_package }}"
+            state: latest
+          become: true
+          register: install_return
+        -
+          name: "Enable and start the linux service"
+          ansible.builtin.service:
+            name: "{{ linux_service }}"
+            state: started
+            enabled: true
+          become: true
+          register: enable_return
+        -
+          name: "push Dynatrace custom configuration event"
+          uri:
+            url: https://{{ dynatrace_api_url }}/api/v2/events/ingest
+            method: POST
+            headers:
+              content-type: application/json
+              Authorization: "Api-Token {{ dynatrace_token }}"
+            body:
+              eventType: CUSTOM_CONFIGURATION
+              timeout: 5
+              title: "{{ configuration_name }}"
+              entitySelector: "type(HOST),tag(\"Ansible Host:{{ linux_host }}\")"
+              properties:
+                configurationName: "{{ configuration_name }}"
+                package: "{{ linux_package }}"
+                service: "{{ linux_service }}"
+                source: "ansible automation platform"
+            body_format: json
+            status_code: 201
+      rescue:
+        -
+          name: "metrics - failed job (ansible.jobs.failed)"
+          include_role:
+            name: dynatrace-ansible-metrics-role
+          vars:
+            dt_metrics_group: "{{ metrics_group }}"
+            dt_metrics_name: jobs.failed
+            dt_metrics_value: 1
+          when: metrics_enabled
+    -
+      name: "metrics - completed job (ansible.jobs.completed)"
+      include_role:
+        name: dynatrace-ansible-metrics-role
+      vars:
+        dt_metrics_group: "{{ metrics_group }}"
+        dt_metrics_name: jobs.completed
+        dt_metrics_value: 1
+      when: metrics_enabled

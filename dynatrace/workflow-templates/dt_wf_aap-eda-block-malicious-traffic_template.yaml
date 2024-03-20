@@ -1,0 +1,235 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.392.1
+  inputs: []
+workflow:
+  title: aap-eda-remediation malicious login attempts template
+  tasks:
+    dql_query_logs:
+      name: dql_query_logs
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: >-
+          fetch logs, from: now()-6m
+
+          | filter matchesValue(log.source, "/var/log/secure") and matchesValue(dt.host_group.id,"host-group-name")
+
+          | filter matchesPhrase(content, "Connection closed by authenticating user")
+
+          | parse content, "LD 'Connection closed by authenticating user ' LD:auth_user SPACE IPV4ADDR:auth_addr ' port'"
+
+          | lookup [fetch dt.entity.host 
+            | expand tags
+            | filter matchesPhrase(tags,"Ansible Tag")
+            | parse tags, "'Ansible Tag:' LD:ansible_host"
+            | fields id, entity.name, tags, ansible_host],sourceField: dt.entity.host, lookupField: id, prefix: "host."
+          | summarize {attempts = count()}, by: {auth_user, auth_addr, host.ansible_host, host.entity.name}
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ( { execution_id }) {
+
+            // THRESHOLD - the threshold for detected number of unauthorized attempts found in the logs (inclusive)
+            let THRESHOLD = 5; // i.e. THRESHOLD = 5; remediate the malicious activity after 5 attempts found in the logs
+
+            // EDA_URL - the Event Driven Ansible Controller Webhook URL with relevant Rulebook Activation
+            let EDA_URL = "http://hostname:5000"; // i.e. EDA_URL = "https://eda.example.com:5000";
+            
+            return { THRESHOLD, EDA_URL };
+          }
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    js_process_results:
+      name: js_process_results
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: |-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+          const LOGS_TASK = 'dql_query_logs';
+
+          export default async function ({ execution_id }) {
+            
+            // get the execution details from the execution event
+            const ex = await execution(execution_id);
+
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+            const threshold = parameters['THRESHOLD'];
+
+            // log query result records
+            const logs_result = await ex.result(LOGS_TASK);
+            const logs = logs_result['records'];
+            var violations = new Array();
+
+            // loop through records and keep entries over the threshold
+            for(var l=0; l<logs.length; l++) {
+              const log = logs[l];
+              if(parseInt(log['attempts']) >= threshold) {
+                violations.push(log);
+              }
+            }
+
+            return { violations };
+          }
+      position:
+        x: 0
+        y: 3
+      predecessors:
+        - dql_query_logs
+      conditions:
+        states:
+          dql_query_logs: SUCCESS
+        custom: "{{ result('dql_query_logs')['records'] | length >= 1 }}"
+    js_eda_send_remediation:
+      name: js_eda_send_remediation
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+
+          const REMEDIATIONS_TASK = 'js_process_remediations';
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+            const eda_url = parameters['EDA_URL'];
+            
+            // get the remediationAction loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const remediationActionDetails = actionEx.loopItem['results'];
+            const remediationAction = remediationActionDetails['remediationAction'];
+            const host = remediationActionDetails['host'];
+            const auth_addr = remediationActionDetails['auth_addr'];
+
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+            method: "POST",
+            headers: {
+              'content-type': "application/json",
+            },
+              body: JSON.stringify(remediationActionDetails)
+            };
+            
+            // execute the fetch() api call to register the user
+            const resp = await fetch(eda_url,options);
+            const eda_response_code = resp.status;
+            
+            // return the remediation details
+            return { 'host': host, 'auth_addr': auth_addr, 'remediationAction': remediationAction, 'response': eda_response_code };
+          }
+      position:
+        x: 0
+        y: 5
+      predecessors:
+        - js_process_remediations
+      conditions:
+        states:
+          js_process_remediations: SUCCESS
+        custom: "{{ result('js_process_remediations') | length >= 1 }}"
+      concurrency: 1
+      withItems: results in {{ result('js_process_remediations') }}
+    js_process_remediations:
+      name: js_process_remediations
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: |-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          const PARAMETERS_TASK = 'js_set_parameters';
+          const VIOLATIONS_TASK = 'js_process_results';
+
+          export default async function ({ execution_id }) {
+
+            // create array of all remediationActions to send to EDA
+            var remediationActions = new Array();
+            
+            // get parameters and results from previous tasks
+            const ex = await execution(execution_id);
+            
+            // parameters
+            const parameters = await ex.result(PARAMETERS_TASK);
+
+            // violations
+            const violations_result = await ex.result(VIOLATIONS_TASK);
+            const violations = violations_result['violations'];
+
+            // collect all violation details as remediation actions
+            for(var v=0; v<violations.length; v++) {
+              const violation = violations[v];
+              const rA = {
+                'execution_id': execution_id,
+                'type': 'configuration',
+                'remediationAction': 'manage firewalld rich rule configuration',
+                'auth_user': violation['auth_user'],
+                'auth_addr': violation['auth_addr'],
+                'entity_host_name': violation['host.entity.name'],
+                'host': violation['host.ansible_host'],
+                'attempts': violation['attempts']
+              };
+              remediationActions.push(rA);
+            }
+            
+            return remediationActions;
+            
+          }
+      position:
+        x: 0
+        y: 4
+      predecessors:
+        - js_process_results
+      conditions:
+        states:
+          js_process_results: SUCCESS
+        custom: "{{ result('js_process_results') | length >= 1 }}"
+  description: ""
+  trigger:
+    schedule:
+      rule: null
+      trigger:
+        type: interval
+        intervalMinutes: 5
+      timezone: America/Chicago
+      isActive: false
+      isFaulty: false
+      filterParameters:
+        earliestStart: 2024-03-06T00:00:00.000Z
+        earliestStartTime: 00:00
+      inputs: {}
+  schemaVersion: 3

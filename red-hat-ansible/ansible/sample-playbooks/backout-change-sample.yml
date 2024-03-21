@@ -1,0 +1,34 @@
+# backout change with ansible
+# send contextual event to dynatrace
+---
+-
+  hosts: localhost
+  name: "backout change with Ansible"
+  tasks:
+    -
+      name: "back out the previous change with Ansible task(s)" # task should set the state of the environment back to what it was previously
+      uri:
+        url: "replace this module with the module of your choice to perform the change"
+    -
+      name: "send Dynatrace custom configuration event with business context information" # add this task to your existing playbooks
+      uri:
+            url: https://{{ dynatrace_api_url }}/api/v2/events/ingest # dynatrace events api
+            # https://docs.dynatrace.com/docs/dynatrace-api/environment-api/events-v2/post-event
+            method: POST
+            headers:
+              content-type: application/json
+              Authorization: "Api-Token {{ dynatrace_token }}" # api token with 'events.ingest' scope
+            body:
+              eventType: CUSTOM_CONFIGURATION
+              timeout: 5
+              title: "{{ configuration_type }}" # the type and title of the change, indicating a back out of a change
+              entitySelector: "type(SERVICE),tags(key:value)" # entity selector matching the dynatrace entity changed
+              properties:
+                change ticket: "{{ configuration_change_ticket }}" # change ticket number
+                details: "{{ configuration_details }}" # brief description of the change and back out
+                # add additional properties as needed (schemaless)
+                source: ansible automation platform # indicates the change was made by ansible
+                remediationAction: "{{ deployment_remediation }}" # the remediation playbook to rollback the change, optional on back out event
+                # remediationAction is the most important piece, this is used to rollback the change if it causes a problem
+            body_format: json
+            status_code: 201
